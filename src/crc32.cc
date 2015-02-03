@@ -79,7 +79,7 @@ static const uint32_t crc32tab[256] = {
 };
 
 
-extern "C" uint32_t hash_crc32(const uint8_t *key, size_t key_length)
+static uint32_t _hash_crc32(const uint8_t *key, size_t key_length)
 {
     uint64_t x;
     uint32_t crc = std::numeric_limits<uint32_t>::max();
@@ -88,7 +88,12 @@ extern "C" uint32_t hash_crc32(const uint8_t *key, size_t key_length)
         crc = (crc >> 8) ^ crc32tab[(crc ^ (uint64_t)key[x]) & 0xff];
     }
 
-    return (crc ^ 0xFFFFFFFF);
+    return crc;
+}
+
+uint32_t hash_crc32(const uint8_t *key, size_t key_length)
+{
+    return (_hash_crc32(key, key_length) ^ 0xFFFFFFFF);
 }
 
 /*
@@ -130,4 +135,12 @@ uint32_t get_checksum(const uint8_t* buf,
         cb_assert(mode == CRC32);
         return hash_crc32(buf, buf_len);
     }
+}
+
+/*
+    Client compatible hash_crc32
+*/
+uint32_t client_hash_crc32(const uint8_t *key, size_t key_length)
+{
+    return ((~_hash_crc32(key, key_length)) >> 16) & 0x7fff; // moxi/lcb etc... do this
 }

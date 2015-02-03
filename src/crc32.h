@@ -56,3 +56,6 @@ int perform_integrity_check(const uint8_t* buf,
                             uint32_t checksum,
                             crc_mode_e mode);
 
+/* client compatible hash_crc32 */
+uint32_t client_hash_crc32(const uint8_t *key, size_t key_length);
+
