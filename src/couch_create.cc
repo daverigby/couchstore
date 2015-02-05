@@ -21,22 +21,24 @@ enum VBucketState {
     VB_UNMANAGED
 };
 
+enum DocType {
+    BINARY_DOC,
+    BINARY_DOC_COMPRESSED,
+    JSON_DOC,
+    JSON_DOC_COMPRESSED
+};
+
 class ProgramParameters {
 public:
 
-    enum DocType {
-        BINARY_DOC, //only binary at the moment
-        BINARY_DOC_COMPRESSED,
-        JSON_DOC,
-        JSON_DOC_COMPRESSED
-    };
+
 
     static const bool reuse_couch_files_default = false;
     static const int vbc_default = 1024;
     static const int key_count_default = 2048;
     static const int keys_per_flush_default = 512;
     static const int doc_len_default = 256;
-    static const DocType doc_type_default = BINARY_DOC;
+    static const DocType doc_type_default = BINARY_DOC_COMPRESSED;
 
     ProgramParameters()
         :
@@ -61,12 +63,13 @@ public:
                 {"keys", required_argument, 0, 'k'},
                 {"keys_per_flush", required_argument, 0, 'f'},
                 {"doc_len", required_argument, 0, 'd'},
+                {"doc_type", required_argument, 0, 't'},
                 {0, 0, 0, 0}
             };
             /* getopt_long stores the option index here. */
             int option_index = 0;
 
-            int c = getopt_long (argc, argv, "v:k:f:d:r", long_options, &option_index);
+            int c = getopt_long (argc, argv, "v:k:f:d:t:r", long_options, &option_index);
 
             /* Detect the end of the options. */
             if (c == -1) {
@@ -98,6 +101,15 @@ public:
 
                 case 'r': {
                     reuse_couch_files = true;
+                    break;
+                }
+
+                case 't': {
+                    if (strcmp(optarg, "binary") == 0) {
+                        doc_type = BINARY_DOC;
+                    } else if (strcmp(optarg, "binarycompressed") == 0) {
+                        doc_type = BINARY_DOC_COMPRESSED;
+                    }
                     break;
                 }
 
@@ -194,6 +206,10 @@ public:
         return string("getDocTypeString failure");
     }
 
+    DocType getDocType() const {
+        return doc_type;
+    }
+
     bool isVbucketManaged(int vb) const {
         if (vb > vbc) {
             return false;
@@ -213,25 +229,28 @@ public:
         cerr << endl;
         cerr << "couch_create <options> <vbucket list>" << endl;
         cerr << "options:" << endl;
-        cerr << "    --reuse,-r: Reuse couch-files (any re-used file must have a vbstate document) (default " << reuse_couch_files_default << ")" << endl;
-        cerr << "    --vbc, -v <integer>:  Number of vbuckets (default " << vbc_default << ")" << endl;
-        cerr << "    --keys, -k <integer>:  Number of keys to create (default " << key_count_default << ")" << endl;
-        cerr << "    --keys_per_flush, -f <integer>:  Number of keys per vbucket before committing to disk (default " << keys_per_flush_default << ")" << endl;
-        cerr << "    --doc_len,-d <integer>:  Number of bytes for the document body (default " << doc_len_default << ")" << endl;
+        cerr << "    --reuse,-r: Reuse couch-files (any re-used file must have a vbstate document) (default " << reuse_couch_files_default << ")." << endl;
+        cerr << "    --vbc, -v <integer>:  Number of vbuckets (default " << vbc_default << ")." << endl;
+        cerr << "    --keys, -k <integer>:  Number of keys to create (default " << key_count_default << ")." << endl;
+        cerr << "    --keys_per_flush, -f <integer>:  Number of keys per vbucket before committing to disk (default " << keys_per_flush_default << ")." << endl;
+        cerr << "    --doc_len,-d <integer>:  Number of bytes for the document body (default " << doc_len_default << ")." << endl;
+        cerr << "    --doc_type,-t <binary|binarycompressed>:  Document type." << endl;
+
         cerr << endl << "vbucket list (optional space separated values):" << endl;
-        cerr << "    Specify a list of vbuckets to manage and optionally the state. " <<
-                "E.g. vbucket 1 can be specified as 1 (defaults to active if creating vbuckets) or 1a (for active) or 1r (for replica)" << endl << endl;
+        cerr << "    Specify a list of vbuckets to manage and optionally the state. " << endl <<
+                "E.g. VB 1 can be specified as '1' (defaults to active when creating vbuckets) or '1a' (for active) or '1r' (for replica)." << endl <<
+                "Omiting the vbucket list means all vbuckets will be created." << endl;
 
         cerr <<
-            "Two modes of operation." << endl <<
-            "    1) Re-use vbuckets (--reuse or -r) \"Automatic mode\"" << endl <<
+            "Two modes of operation:" << endl <<
+            "    1) Re-use vbuckets (--reuse or -r) \"Automatic mode\":" << endl <<
             "    In this mode of operation the program will only write key/values into vbucket files it finds in the current directory." << endl <<
             "    Ideally the vbucket files are empty of documents, but must have a vbstate local doc." << endl <<
-            "    The intent of this mode is for a cluster and bucket to be pre-created, but empty and then to simply "
-            "populate the files found on each node without having to consider which are active/replica." << endl;
+            "    The intent of this mode is for a cluster and bucket to be pre-created, but empty and then to simply " << endl <<
+            "    populate the files found on each node without having to consider which are active/replica." << endl << endl;;
 
         cerr <<
-            "    2) Create vbuckets" << endl <<
+            "    2) Create vbuckets:" << endl <<
             "    In this mode of operation the program will create new vbucket files. The user must make the decision about what is active/replica" << endl << endl;
 
         cerr << "Examples: " << endl;
@@ -288,7 +307,7 @@ class Document {
     };
 
 public:
-    Document(const char* k, int klen, int dlen)
+    Document(const char* k, int klen, DocType dtype, int dlen)
     : meta(1, 0, 0),
       key_len(klen),
       key(NULL),
@@ -305,7 +324,19 @@ public:
         doc_info.size = doc.data.size;
         doc_info.db_seq = 0;//db_seq;
         doc_info.rev_seq = 1;// ++db_seq;
-        doc_info.content_meta = COUCH_DOC_NON_JSON_MODE;
+
+        if (dtype == BINARY_DOC_COMPRESSED) {
+            doc_info.content_meta = COUCH_DOC_NON_JSON_MODE | COUCH_DOC_IS_COMPRESSED;
+        } else if (dtype == BINARY_DOC) {
+            doc_info.content_meta = COUCH_DOC_NON_JSON_MODE;
+        } else if (dtype == JSON_DOC_COMPRESSED) {
+            doc_info.content_meta = COUCH_DOC_IS_JSON | COUCH_DOC_IS_COMPRESSED;
+        } else if (dtype == JSON_DOC) {
+            doc_info.content_meta = COUCH_DOC_IS_JSON;
+        } else  {
+            doc_info.content_meta = COUCH_DOC_NON_JSON_MODE;
+        }
+
         doc_info.rev_meta.buf = reinterpret_cast<char*>(&meta);
         doc_info.rev_meta.size =  meta.getSize();
         doc_info.deleted = 0;
@@ -459,7 +490,7 @@ public:
 
     void add_doc(char* k, int klen, int dlen) {
         if (docs[next_free_doc] == nullptr) {
-            docs[next_free_doc] = unique_ptr<Document>(new Document(k, klen, dlen));
+            docs[next_free_doc] = unique_ptr<Document>(new Document(k, klen, params.getDocType(), dlen));
         }
 
         docs[next_free_doc]->set_doc(k, klen, dlen);
@@ -481,8 +512,11 @@ public:
                 doc_array[i] = docs[i]->getDoc();
                 doc_info_array[i] = docs[i]->getDocInfo();
             }
-
-            couchstore_save_documents(handle, doc_array.data(), doc_info_array.data(), pending_documents, 0);
+            int flags = 0;
+            if (params.getDocType() == JSON_DOC_COMPRESSED || params.getDocType() == BINARY_DOC_COMPRESSED) {
+                flags =  COMPRESS_DOC_BODIES;
+            }
+            couchstore_save_documents(handle, doc_array.data(), doc_info_array.data(), pending_documents, flags);
             couchstore_commit(handle);
             documents_saved+=pending_documents;
             next_free_doc = 0;
