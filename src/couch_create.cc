@@ -1,3 +1,25 @@
+/**
+ * @copyright 2015 Couchbase, Inc.
+ *
+ * @author Jim Walker (jim@couchbase.com)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ **/
+
+//
+// couch_create, a program for 'offline' generation of Couchbase compatible couchstore files.
+//
+
 #include "libcouchstore/couch_db.h"
 #include "crc32.h"
 #include <string>
@@ -12,6 +34,7 @@
 #include <getopt.h>
 #include <exception>
 #include <atomic>
+#include <climits>
 
 using namespace std;
 
@@ -28,32 +51,41 @@ enum DocType {
     JSON_DOC_COMPRESSED
 };
 
+//
+// ProgramParameters:
+// An object to process argv/argc and carry around the parameters to operate with.
+//
 class ProgramParameters {
 public:
 
-
-
+    // Define all program defaults as static
     static const bool reuse_couch_files_default = false;
     static const int vbc_default = 1024;
-    static const int key_count_default = 2048;
+    static const uint64_t key_count_default = 2048;
     static const int keys_per_flush_default = 512;
     static const int doc_len_default = 256;
+    static const int keys_per_vbucket_default = false;
     static const DocType doc_type_default = BINARY_DOC_COMPRESSED;
 
+    //
+    // Construct a program parameters, all parameters assigned default settings
+    //
     ProgramParameters()
         :
         reuse_couch_files(reuse_couch_files_default),
         vbc(vbc_default),
         key_count(key_count_default),
+        keys_per_vbucket(keys_per_vbucket_default),
         keys_per_flush(keys_per_flush_default),
         doc_len(doc_len_default),
         doc_type(doc_type_default),
-        vbuckets(vbc_default) {
+        vbuckets(vbc_default),
+        vbuckets_managed(0) {
         fill(vbuckets.begin(), vbuckets.end(), VB_UNMANAGED);
     }
 
     void load(int argc, char** argv) {
-
+        const int KEYS_PER_VBUCKET = 1000;
         while (1)
         {
             static struct option long_options[] =
@@ -61,9 +93,10 @@ public:
                 {"reuse", no_argument, 0, 'r'},
                 {"vbc", required_argument, 0, 'v'},
                 {"keys", required_argument, 0, 'k'},
-                {"keys_per_flush", required_argument, 0, 'f'},
-                {"doc_len", required_argument, 0, 'd'},
-                {"doc_type", required_argument, 0, 't'},
+                {"keys-per-vbucket", no_argument, 0, KEYS_PER_VBUCKET},
+                {"keys-per-flush", required_argument, 0, 'f'},
+                {"doc-len", required_argument, 0, 'd'},
+                {"doc-type", required_argument, 0, 't'},
                 {0, 0, 0, 0}
             };
             /* getopt_long stores the option index here. */
@@ -85,7 +118,7 @@ public:
                 }
 
                 case 'k': {
-                    key_count = atoi(optarg);
+                    key_count = atoll(optarg);
                     break;
                 }
 
@@ -113,6 +146,11 @@ public:
                     break;
                 }
 
+                case KEYS_PER_VBUCKET : {
+                    keys_per_vbucket = true;
+                    break;
+                }
+
                 default: {
                     usage(1);
                 }
@@ -123,13 +161,11 @@ public:
         if (optind < argc)
         {
             while (optind < argc) {
-                // a or r present?
-
                 int i = atoi(argv[optind]);
                 if(i < vbc) {
                     // a or r present?
                     VBucketState s = VB_ACTIVE;
-                    for (size_t i; i < strlen(argv[optind]); i++) {
+                    for (size_t i = 0; i < strlen(argv[optind]); i++) {
                         if (argv[optind][i] == 'a') {
                             s = VB_ACTIVE;
                         } else if (argv[optind][i] == 'r') {
@@ -137,6 +173,7 @@ public:
                         }
                     }
                     vbuckets[i] = s;
+                    vbuckets_managed++; // keep track of how many we are managing
                     cout << "Managing VB " << i;
                     if (s == VB_ACTIVE) {
                         cout << " active" << endl;
@@ -150,11 +187,14 @@ public:
         } else {
             for(int i = 0; i < vbc; i++) {
                 vbuckets[i] = VB_ACTIVE;
+                vbuckets_managed++;
             }
         }
     }
 
-    // validate params
+    //
+    // return true if the current parameters are good, else print an error and return false.
+    //
     bool validate() const {
         if (vbc <= 0) {
             cerr << "Error: vbc less than or equal to 0 - " << vbc << endl;
@@ -163,27 +203,27 @@ public:
         return true;
     }
 
-    int16_t getVbc() const {
+    int16_t get_vbc() const {
         return vbc;
     }
 
-    int getKeyCount() const {
+    uint64_t get_key_count() const {
         return key_count;
     }
 
-    int getKeysPerFlush() const {
+    int get_keys_per_flush() const {
         return keys_per_flush;
     }
 
-    int getDocLen() const {
+    int get_doc_len() const {
         return doc_len;
     }
 
-    bool getReuseCouchFiles() const {
+    bool get_reuse_couch_files() const {
         return reuse_couch_files;
     }
 
-    string getDocTypeString() const {
+    string get_doc_type_string() const {
         switch(doc_type) {
             case BINARY_DOC:
             {
@@ -206,23 +246,32 @@ public:
         return string("getDocTypeString failure");
     }
 
-    DocType getDocType() const {
+    DocType get_doc_type() const {
         return doc_type;
     }
 
-    bool isVbucketManaged(int vb) const {
+    bool is_keys_per_vbucket() const {
+        return keys_per_vbucket;
+    }
+
+    bool is_vbucket_managed(int vb) const {
         if (vb > vbc) {
             return false;
         }
         return vbuckets[vb] != VB_UNMANAGED;
     }
 
-    VBucketState getVBucketState(int vb) const {
+    int get_vbuckets_managed() {
+        return vbuckets_managed;
+    }
+
+    VBucketState get_vbucket_state(int vb) const {
         return vbuckets[vb];
     }
 
-    void disableVbucket(int vb) {
+    void disable_vbucket(int vb) {
         vbuckets[vb] =  VB_UNMANAGED;
+        vbuckets_managed--;
     }
 
     static void usage(int exit_code) {
@@ -232,9 +281,10 @@ public:
         cerr << "    --reuse,-r: Reuse couch-files (any re-used file must have a vbstate document) (default " << reuse_couch_files_default << ")." << endl;
         cerr << "    --vbc, -v <integer>:  Number of vbuckets (default " << vbc_default << ")." << endl;
         cerr << "    --keys, -k <integer>:  Number of keys to create (default " << key_count_default << ")." << endl;
-        cerr << "    --keys_per_flush, -f <integer>:  Number of keys per vbucket before committing to disk (default " << keys_per_flush_default << ")." << endl;
-        cerr << "    --doc_len,-d <integer>:  Number of bytes for the document body (default " << doc_len_default << ")." << endl;
-        cerr << "    --doc_type,-t <binary|binarycompressed>:  Document type." << endl;
+        cerr << "    --keys-per-vbucket:  The keys value is how many keys for each vbucket default " << keys_per_vbucket_default << ")." << endl;
+        cerr << "    --keys-per-flush, -f <integer>:  Number of keys per vbucket before committing to disk (default " << keys_per_flush_default << ")." << endl;
+        cerr << "    --doc-len,-d <integer>:  Number of bytes for the document body (default " << doc_len_default << ")." << endl;
+        cerr << "    --doc-type,-t <binary|binarycompressed>:  Document type." << endl;
 
         cerr << endl << "vbucket list (optional space separated values):" << endl;
         cerr << "    Specify a list of vbuckets to manage and optionally the state. " << endl <<
@@ -260,6 +310,8 @@ public:
         cerr << "    > ./couch_create -k 10000 0a 1r 2a 3r" << endl << endl;
         cerr << "  Iterate over 10,000 keys and re-use existing couch-files"<< endl;
         cerr << "    > ./couch_create -k 10000 -r" << endl << endl;
+        cerr << "  Create 10000 keys for each vbucket and re-use existing couch-files"<< endl;
+        cerr << "    > ./couch_create -k 10000 --keys-per-vbucket -r" << endl << endl;
 
         exit(exit_code);
     }
@@ -268,32 +320,37 @@ private:
 
     bool reuse_couch_files;
     int16_t vbc;
-    int key_count;
+    uint64_t key_count;
+    bool keys_per_vbucket;
     int keys_per_flush;
     int doc_len;
     DocType doc_type;
     vector<VBucketState> vbuckets;
+    int vbuckets_managed;
 };
 
+//
+// Class representing a single couchstore document
+//
 class Document {
     class Meta {
     public:
         Meta(uint64_t c, uint32_t e, uint32_t f) : cas(c), exptime(e), flags(f), flex_meta_code(0x01), flex_value(0x0) {
         }
 
-        void setCas(uint64_t cas) {
+        void set_cas(uint64_t cas) {
             this->cas = cas;
         }
 
-        void setExptime(uint32_t exptime) {
+        void set_exptime(uint32_t exptime) {
             this->exptime = exptime;
         }
 
-        void setFlags(uint32_t flags) {
+        void set_flags(uint32_t flags) {
             this->flags = flags;
         }
 
-        size_t getSize() const {
+        size_t get_size() const {
             // Not safe to use sizeof(Meta) due to trailing padding
             return sizeof(cas) + sizeof(exptime) + sizeof(flags) + sizeof(flex_meta_code) + sizeof(flex_value);
         }
@@ -338,7 +395,7 @@ public:
         }
 
         doc_info.rev_meta.buf = reinterpret_cast<char*>(&meta);
-        doc_info.rev_meta.size =  meta.getSize();
+        doc_info.rev_meta.size =  meta.get_size();
         doc_info.deleted = 0;
     }
 
@@ -370,11 +427,11 @@ public:
         }
     }
 
-    Doc* getDoc() {
+    Doc* get_doc() {
         return &doc;
     }
 
-    DocInfo* getDocInfo() {
+    DocInfo* get_doc_info() {
         return &doc_info;
     }
 private:
@@ -392,6 +449,10 @@ private:
 
 uint64_t Document::db_seq = 0;
 
+//
+// A class representing a VBucket.
+// This object holds a queue of key/values (documents) and manages their writing to the couch-file.
+//
 class VBucket {
 
 public:
@@ -407,19 +468,24 @@ public:
         virtual const char* what() const throw() {return "Error opening couch_file (check ulimit -n).";}
     } exception3;
 
+    //
+    // Constructor opens file and validates the state.
+    // throws exceptions if not safe to continue
+    //
     VBucket(char* filename,
             int vb,
-            atomic_int& saved_counter,
+            atomic_uint_fast64_t& saved_counter,
             ProgramParameters& params_ref)
         :
         handle(NULL),
         next_free_doc(0),
-        flush_threshold(params_ref.getKeysPerFlush()),
-        docs(params_ref.getKeysPerFlush()),
+        flush_threshold(params_ref.get_keys_per_flush()),
+        docs(params_ref.get_keys_per_flush()),
         pending_documents(0),
         documents_saved(saved_counter),
         params(params_ref),
-        vbid(vb) {
+        vbid(vb),
+        doc_count(0) {
         couchstore_error_t err = couchstore_open_db(filename, COUCHSTORE_OPEN_FLAG_CREATE, &handle);
         if (err != COUCHSTORE_SUCCESS) {
             throw exception3;
@@ -428,12 +494,12 @@ public:
         if (read_vbstate()) {
             // A vbstate document exists.
             // Can only proceed if we're in reuse mode
-            if (!params.getReuseCouchFiles()) {
+            if (!params.get_reuse_couch_files()) {
                 destroy();
                 throw exception1;
             }
         } else {
-            if (params.getReuseCouchFiles()) {
+            if (params.get_reuse_couch_files()) {
                 destroy();
                 throw exception2;
             }
@@ -448,7 +514,7 @@ public:
     }
 
     //
-    // Return true if the vbstate document is present.
+    // Return true if the special vbstate document is present.
     //
     bool read_vbstate() {
         LocalDoc* local_doc = nullptr;
@@ -460,11 +526,11 @@ public:
     }
 
     //
-    // Set the vbstate of the document
+    // Set the special vbstate document
     //
     void set_vbstate() {
         stringstream jsonState;
-        string state_string = params.getVBucketState(vbid) == VB_ACTIVE ? "active" : "replica";
+        string state_string = params.get_vbucket_state(vbid) == VB_ACTIVE ? "active" : "replica";
         jsonState << "{\"state\": \"" << state_string << "\""
                   << ",\"checkpoint_id\": \"0\""
                   << ",\"max_deleted_seqno\": \"0\""
@@ -488,13 +554,18 @@ public:
         }
     }
 
+    //
+    // Add a new key/value to the queue
+    // Flushes the queue if has reached the flush_threshold.
+    //
     void add_doc(char* k, int klen, int dlen) {
         if (docs[next_free_doc] == nullptr) {
-            docs[next_free_doc] = unique_ptr<Document>(new Document(k, klen, params.getDocType(), dlen));
+            docs[next_free_doc] = unique_ptr<Document>(new Document(k, klen, params.get_doc_type(), dlen));
         }
 
         docs[next_free_doc]->set_doc(k, klen, dlen);
         pending_documents++;
+        doc_count++;
 
         if (pending_documents == flush_threshold) {
             save_docs();
@@ -503,25 +574,32 @@ public:
         }
     }
 
+    //
+    // Save any pending documents to the couch file
+    //
     void save_docs() {
         if(pending_documents) {
             vector<Doc*> doc_array(pending_documents);
             vector<DocInfo*> doc_info_array(pending_documents);
 
             for(int i = 0; i < pending_documents; i++) {
-                doc_array[i] = docs[i]->getDoc();
-                doc_info_array[i] = docs[i]->getDocInfo();
+                doc_array[i] = docs[i]->get_doc();
+                doc_info_array[i] = docs[i]->get_doc_info();
             }
             int flags = 0;
-            if (params.getDocType() == JSON_DOC_COMPRESSED || params.getDocType() == BINARY_DOC_COMPRESSED) {
+            if (params.get_doc_type() == JSON_DOC_COMPRESSED || params.get_doc_type() == BINARY_DOC_COMPRESSED) {
                 flags =  COMPRESS_DOC_BODIES;
             }
             couchstore_save_documents(handle, doc_array.data(), doc_info_array.data(), pending_documents, flags);
             couchstore_commit(handle);
-            documents_saved+=pending_documents;
+            documents_saved += pending_documents;
             next_free_doc = 0;
             pending_documents = 0;
         }
+    }
+
+    uint64_t get_doc_count() {
+        return doc_count;
     }
 
 private:
@@ -536,10 +614,11 @@ private:
     int flush_threshold;
     vector< unique_ptr<Document> > docs;
     int pending_documents;
-    atomic_int& documents_saved;
+    atomic_uint_fast64_t& documents_saved;
     LocalDoc vbstate;
     ProgramParameters& params;
     int vbid;
+    uint64_t doc_count;
 };
 
 int main(int argc, char **argv) {
@@ -553,41 +632,45 @@ int main(int argc, char **argv) {
 
     uint64_t key_value = 0;
     char key[64];
-    int percent = 0;
-    const int percentage_report = 5;
-
-    cout << "Generating " << parameters.getKeyCount() << " keys" << endl;
-    if (parameters.getKeyCount() > 1) {
-        snprintf(key, 64, "K%020" PRId64, (uint64_t)parameters.getKeyCount() - 1);
+    uint64_t key_max = parameters.is_keys_per_vbucket() ? ULLONG_MAX : parameters.get_key_count();
+    cout << "Generating " << parameters.get_key_count() << " keys ";
+    if (parameters.is_keys_per_vbucket()) {
+        cout << "per VB";
+    }
+    cout << endl;
+    if (parameters.get_key_count() > 1) {
+        snprintf(key, 64, "K%020" PRId64, (uint64_t)key_max- 1);
         cout << "Key pattern is K00000000000000000000 to " << key << endl;
     } else {
         cout << "Key pattern is K00000000000000000000" << endl;
     }
 
-    cout << "vbucket count set to " << parameters.getVbc() << endl;
-    cout << "keys per flush set to " << parameters.getKeysPerFlush() << endl;
-    cout << "Document type is " << parameters.getDocLen() << " bytes " << parameters.getDocTypeString() << endl;
+    cout << "vbucket count set to " << parameters.get_vbc() << endl;
+    cout << "keys per flush set to " << parameters.get_keys_per_flush() << endl;
+    cout << "Document type is " << parameters.get_doc_len() << " bytes " << parameters.get_doc_type_string() << endl;
 
-    if (parameters.getReuseCouchFiles()) {
+    if (parameters.get_reuse_couch_files()) {
         cout << "Re-using any existing couch-files" << endl;
     } else {
         cout << "Creating new couch-files" << endl;
     }
 
-    vector< unique_ptr<VBucket> > vb_handles(parameters.getVbc());
+    vector< unique_ptr<VBucket> > vb_handles(parameters.get_vbc());
 
-    atomic_int documents_saved(0);
-    int jj = 0;
+    atomic_uint_fast64_t documents_saved(0);
+    bool start_counting_vbuckets = false;
 
-    for (int ii = 0; ii < parameters.getKeyCount(); ii++) {
+    // Loop through the key space and create keys, test each key to see if we are managing the vbucket it maps to.
+    for (uint64_t ii = 0; ii < key_max; ii++) {
         int key_len = snprintf(key, 64, "K%020" PRId64, key_value);
-        int vbid = client_hash_crc32(reinterpret_cast<uint8_t*>(key), key_len) & (parameters.getVbc()-1);
+        int vbid = client_hash_crc32(reinterpret_cast<uint8_t*>(key), key_len) & (parameters.get_vbc()-1);
 
         // Only if the vbucket is managed generate the doc
-        if (parameters.isVbucketManaged(vbid)) {
+        if (parameters.is_vbucket_managed(vbid)) {
             if (vb_handles[vbid] == nullptr) {
                 char  filename[32];
                 snprintf(filename, 32, "%d.couch.1", vbid);
+                start_counting_vbuckets = true;
                 try {
                     vb_handles[vbid] = unique_ptr<VBucket>(new VBucket(filename,
                                                                        vbid,
@@ -595,22 +678,27 @@ int main(int argc, char **argv) {
                                                                        parameters));
                 } catch(exception& e) {
                     cerr << "Not creating a VB handler for " << filename << " \"" << e.what() << "\"" << endl;
-                    parameters.disableVbucket(vbid);
+                    parameters.disable_vbucket(vbid);
                 }
             }
 
             // if there's now a handle, go for it
             if (vb_handles[vbid] != nullptr) {
-                vb_handles[vbid]->add_doc(key, key_len, parameters.getDocLen());
+                vb_handles[vbid]->add_doc(key, key_len, parameters.get_doc_len());
+
+                // If we're generating keys per vbucket, stop managing this vbucket when we've it the limit
+                if (parameters.is_keys_per_vbucket() && (vb_handles[vbid]->get_doc_count() == parameters.get_key_count())) {
+                    vb_handles[vbid].reset(); // done with this VB
+                    parameters.disable_vbucket(vbid);
+                }
             }
 
         }
-        jj++;
         key_value++;
-        if (jj >= ((parameters.getKeyCount() / 100) * percentage_report)) {
-            percent += percentage_report;
-            cout << percent << "%" << endl;
-            jj = 0;
+
+        // Stop when there's no more vbuckets managed, yet we're past starting
+        if (start_counting_vbuckets && parameters.get_vbuckets_managed() == 0) {
+            break;
         }
     }
 
