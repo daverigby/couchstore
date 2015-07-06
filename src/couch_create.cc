@@ -35,6 +35,7 @@
 #include <exception>
 #include <atomic>
 #include <climits>
+#include <cstdlib>
 
 using namespace std;
 
@@ -61,10 +62,12 @@ public:
     // Define all program defaults as static
     static const bool reuse_couch_files_default = false;
     static const int vbc_default = 1024;
-    static const uint64_t key_count_default = 2048;
+    static const uint64_t key_count_default = 0;
     static const int keys_per_flush_default = 512;
     static const int doc_len_default = 256;
     static const int keys_per_vbucket_default = false;
+    static const uint64_t start_key_default = 0;
+    static const bool low_compression_default = false;
     static const DocType doc_type_default = BINARY_DOC_COMPRESSED;
 
     //
@@ -80,7 +83,9 @@ public:
         doc_len(doc_len_default),
         doc_type(doc_type_default),
         vbuckets(vbc_default),
-        vbuckets_managed(0) {
+        vbuckets_managed(0),
+        start_key(start_key_default),
+        low_compression(low_compression_default) {
         fill(vbuckets.begin(), vbuckets.end(), VB_UNMANAGED);
     }
 
@@ -97,12 +102,14 @@ public:
                 {"keys-per-flush", required_argument, 0, 'f'},
                 {"doc-len", required_argument, 0, 'd'},
                 {"doc-type", required_argument, 0, 't'},
+                {"start-key", required_argument, 0, 's'},
+                {"low-compression", no_argument, 0, 'l'},
                 {0, 0, 0, 0}
             };
             /* getopt_long stores the option index here. */
             int option_index = 0;
 
-            int c = getopt_long (argc, argv, "v:k:f:d:t:r", long_options, &option_index);
+            int c = getopt_long (argc, argv, "s:v:k:f:d:t:rl", long_options, &option_index);
 
             /* Detect the end of the options. */
             if (c == -1) {
@@ -118,7 +125,7 @@ public:
                 }
 
                 case 'k': {
-                    key_count = atoll(optarg);
+                    key_count = strtoull(optarg, 0, 10);
                     break;
                 }
 
@@ -134,6 +141,16 @@ public:
 
                 case 'r': {
                     reuse_couch_files = true;
+                    break;
+                }
+
+                case 'l': {
+                    low_compression = true;
+                    break;
+                }
+
+                case 's': {
+                    start_key = strtoull(optarg, 0, 10);
                     break;
                 }
 
@@ -198,6 +215,12 @@ public:
     bool validate() const {
         if (vbc <= 0) {
             cerr << "Error: vbc less than or equal to 0 - " << vbc << endl;
+            return false;
+        }
+
+        // this ensures that the program doesn't run away with no args...
+        if (key_count == 0) {
+            cerr << "Key count 0 or not specified, use -k to set key count to greater than 0" << endl;
             return false;
         }
         return true;
@@ -265,6 +288,10 @@ public:
         return vbuckets_managed;
     }
 
+    uint64_t get_start_key() {
+        return start_key;
+    }
+
     VBucketState get_vbucket_state(int vb) const {
         return vbuckets[vb];
     }
@@ -272,6 +299,10 @@ public:
     void disable_vbucket(int vb) {
         vbuckets[vb] =  VB_UNMANAGED;
         vbuckets_managed--;
+    }
+
+    bool is_low_compression() {
+        return low_compression;
     }
 
     static void usage(int exit_code) {
@@ -285,6 +316,8 @@ public:
         cerr << "    --keys-per-flush, -f <integer>:  Number of keys per vbucket before committing to disk (default " << keys_per_flush_default << ")." << endl;
         cerr << "    --doc-len,-d <integer>:  Number of bytes for the document body (default " << doc_len_default << ")." << endl;
         cerr << "    --doc-type,-t <binary|binarycompressed>:  Document type." << endl;
+        cerr << "    --start-key,-s <integer>:  Specify the first key number (default " << start_key_default << ")." << endl;
+        cerr << "    --low-compression,-l: Generate documents that don't compress well (default " << low_compression_default << ")." << endl;
 
         cerr << endl << "vbucket list (optional space separated values):" << endl;
         cerr << "    Specify a list of vbuckets to manage and optionally the state. " << endl <<
@@ -327,6 +360,8 @@ private:
     DocType doc_type;
     vector<VBucketState> vbuckets;
     int vbuckets_managed;
+    uint64_t start_key;
+    bool low_compression;
 };
 
 //
@@ -364,15 +399,18 @@ class Document {
     };
 
 public:
-    Document(const char* k, int klen, DocType dtype, int dlen)
+    Document(const char* k, int klen, ProgramParameters& params, int dlen)
     : meta(1, 0, 0),
       key_len(klen),
       key(NULL),
       data_len(dlen),
-      data(NULL) {
+      data(NULL),
+      parameters(params) {
         key = new char[klen];
         data = new char[dlen];
         set_doc(k, klen, dlen);
+        memset(&doc_info, 0, sizeof(DocInfo));
+        memset(&doc, 0, sizeof(Doc));
         doc.id.buf = key;
         doc.id.size = klen;
         doc.data.buf = data;
@@ -382,13 +420,13 @@ public:
         doc_info.db_seq = 0;//db_seq;
         doc_info.rev_seq = 1;// ++db_seq;
 
-        if (dtype == BINARY_DOC_COMPRESSED) {
+        if (params.get_doc_type() == BINARY_DOC_COMPRESSED) {
             doc_info.content_meta = COUCH_DOC_NON_JSON_MODE | COUCH_DOC_IS_COMPRESSED;
-        } else if (dtype == BINARY_DOC) {
+        } else if (params.get_doc_type() == BINARY_DOC) {
             doc_info.content_meta = COUCH_DOC_NON_JSON_MODE;
-        } else if (dtype == JSON_DOC_COMPRESSED) {
+        } else if (params.get_doc_type() == JSON_DOC_COMPRESSED) {
             doc_info.content_meta = COUCH_DOC_IS_JSON | COUCH_DOC_IS_COMPRESSED;
-        } else if (dtype == JSON_DOC) {
+        } else if (params.get_doc_type() == JSON_DOC) {
             doc_info.content_meta = COUCH_DOC_IS_JSON;
         } else  {
             doc_info.content_meta = COUCH_DOC_NON_JSON_MODE;
@@ -418,12 +456,20 @@ public:
             doc.data.buf = data;
             doc.data.size = dlen;
         }
-        // Generate ascii data and copy-in key
+
         memcpy(key, k, klen);
-        char data_value = 0;
-        for (int data_index = 0; data_index < dlen; data_index++) {
-            data[data_index] = data_value + '0';
-            data_value = (data_value + 1) % ('Z' - '0');
+        if (parameters.is_low_compression()) {
+            srand(0);
+            for (int data_index = 0; data_index < dlen; data_index++) {
+                char data_value = (rand() % 255) % ('Z' - '0');
+                data[data_index] = data_value + '0';
+            }
+        } else {
+            char data_value = 0;
+            for (int data_index = 0; data_index < dlen; data_index++) {
+                data[data_index] = data_value + '0';
+                data_value = (data_value + 1) % ('Z' - '0');
+            }
         }
     }
 
@@ -443,7 +489,7 @@ private:
     char* key;
     int data_len;
     char* data;
-
+    ProgramParameters& parameters;
     static uint64_t db_seq;
 };
 
@@ -485,8 +531,14 @@ public:
         documents_saved(saved_counter),
         params(params_ref),
         vbid(vb),
-        doc_count(0) {
-        couchstore_error_t err = couchstore_open_db(filename, COUCHSTORE_OPEN_FLAG_CREATE, &handle);
+        doc_count(0),
+        got_vbstate(false),
+        vb_seq(0),
+        ok_to_set_vbstate(true) {
+
+        int flags = params.get_reuse_couch_files() ? COUCHSTORE_OPEN_FLAG_RDONLY : COUCHSTORE_OPEN_FLAG_CREATE;
+
+        couchstore_error_t err = couchstore_open_db(filename, flags, &handle);
         if (err != COUCHSTORE_SUCCESS) {
             throw exception3;
         }
@@ -497,18 +549,28 @@ public:
             if (!params.get_reuse_couch_files()) {
                 destroy();
                 throw exception1;
+            } else {
+                // VB exists and is valid, close and open in write mode.
+                destroy();
+                couchstore_error_t err = couchstore_open_db(filename, COUCHSTORE_OPEN_FLAG_CREATE, &handle);
+                if (err != COUCHSTORE_SUCCESS) {
+                    throw exception3;
+                }
             }
         } else {
             if (params.get_reuse_couch_files()) {
                 destroy();
                 throw exception2;
             }
-            set_vbstate();
         }
+        ok_to_set_vbstate = true;
     }
 
     ~VBucket() {
         save_docs();
+        if (ok_to_set_vbstate) {
+           set_vbstate(); // set/update local vbstate
+        }
         docs.clear();
         destroy();
     }
@@ -520,7 +582,9 @@ public:
         LocalDoc* local_doc = nullptr;
         couchstore_error_t errCode =  couchstore_open_local_document(handle, "_local/vbstate", sizeof("_local/vbstate") - 1, &local_doc);
         if (local_doc) {
-             couchstore_free_local_document(local_doc);
+            got_vbstate = true;
+            vbstate_data.assign(local_doc->json.buf, local_doc->json.size);
+            couchstore_free_local_document(local_doc);
         }
         return errCode == COUCHSTORE_SUCCESS;
     }
@@ -530,17 +594,27 @@ public:
     //
     void set_vbstate() {
         stringstream jsonState;
-        string state_string = params.get_vbucket_state(vbid) == VB_ACTIVE ? "active" : "replica";
+        string state_string;
+        if(got_vbstate) {
+            if (vbstate_data.find("replica") != string::npos) {
+                state_string = "replica";
+            } else {
+                state_string = "active";
+            }
+        } else {
+            state_string = params.get_vbucket_state(vbid) == VB_ACTIVE ? "active" : "replica";
+        }
         jsonState << "{\"state\": \"" << state_string << "\""
                   << ",\"checkpoint_id\": \"0\""
                   << ",\"max_deleted_seqno\": \"0\""
-                  << ",\"snap_start\": \"0\""
-                  << ",\"snap_end\": \"0\""
+                  << ",\"snap_start\": \"" << vb_seq << "\""
+                  << ",\"snap_end\": \"" << vb_seq << "\""
                   << ",\"max_cas\": \"1\""
                   << ",\"drift_counter\": \"0\""
                   << "}";
 
         std::string vbstate_json = jsonState.str();
+        LocalDoc vbstate;
         vbstate.id.buf = (char *)"_local/vbstate";
         vbstate.id.size = sizeof("_local/vbstate") - 1;
         vbstate.json.buf = (char *)vbstate_json.c_str();
@@ -552,6 +626,7 @@ public:
             cerr << "Warning: couchstore_save_local_document failed error="
                  << couchstore_strerror(errCode) << endl;
         }
+        couchstore_commit(handle);
     }
 
     //
@@ -560,12 +635,13 @@ public:
     //
     void add_doc(char* k, int klen, int dlen) {
         if (docs[next_free_doc] == nullptr) {
-            docs[next_free_doc] = unique_ptr<Document>(new Document(k, klen, params.get_doc_type(), dlen));
+            docs[next_free_doc] = unique_ptr<Document>(new Document(k, klen, params, dlen));
         }
 
         docs[next_free_doc]->set_doc(k, klen, dlen);
         pending_documents++;
         doc_count++;
+        vb_seq++;
 
         if (pending_documents == flush_threshold) {
             save_docs();
@@ -586,10 +662,13 @@ public:
                 doc_array[i] = docs[i]->get_doc();
                 doc_info_array[i] = docs[i]->get_doc_info();
             }
+
             int flags = 0;
+
             if (params.get_doc_type() == JSON_DOC_COMPRESSED || params.get_doc_type() == BINARY_DOC_COMPRESSED) {
-                flags =  COMPRESS_DOC_BODIES;
+                flags = COMPRESS_DOC_BODIES;
             }
+
             couchstore_save_documents(handle, doc_array.data(), doc_info_array.data(), pending_documents, flags);
             couchstore_commit(handle);
             documents_saved += pending_documents;
@@ -615,10 +694,13 @@ private:
     vector< unique_ptr<Document> > docs;
     int pending_documents;
     atomic_uint_fast64_t& documents_saved;
-    LocalDoc vbstate;
     ProgramParameters& params;
     int vbid;
     uint64_t doc_count;
+    string vbstate_data;
+    bool got_vbstate;
+    uint64_t vb_seq;
+    bool ok_to_set_vbstate;
 };
 
 int main(int argc, char **argv) {
@@ -639,8 +721,11 @@ int main(int argc, char **argv) {
     }
     cout << endl;
     if (parameters.get_key_count() > 1) {
-        snprintf(key, 64, "K%020" PRId64, (uint64_t)key_max- 1);
-        cout << "Key pattern is K00000000000000000000 to " << key << endl;
+        cout << "Key pattern is ";
+        snprintf(key, 64, "K%020" PRId64, (uint64_t)0 + parameters.get_start_key());
+        cout << key << " to ";
+        snprintf(key, 64, "K%020" PRId64, (uint64_t)((key_max + parameters.get_start_key()) - 1));
+        cout << key << endl;
     } else {
         cout << "Key pattern is K00000000000000000000" << endl;
     }
@@ -661,12 +746,13 @@ int main(int argc, char **argv) {
     bool start_counting_vbuckets = false;
 
     // Loop through the key space and create keys, test each key to see if we are managing the vbucket it maps to.
-    for (uint64_t ii = 0; ii < key_max; ii++) {
+    for (uint64_t ii = parameters.get_start_key(); ii < (key_max + parameters.get_start_key()); ii++) {
         int key_len = snprintf(key, 64, "K%020" PRId64, key_value);
-        int vbid = client_hash_crc32(reinterpret_cast<uint8_t*>(key), key_len) & (parameters.get_vbc()-1);
+        int vbid = client_hash_crc32(reinterpret_cast<uint8_t*>(key), key_len) % (parameters.get_vbc());
 
         // Only if the vbucket is managed generate the doc
         if (parameters.is_vbucket_managed(vbid)) {
+
             if (vb_handles[vbid] == nullptr) {
                 char  filename[32];
                 snprintf(filename, 32, "%d.couch.1", vbid);
@@ -679,6 +765,7 @@ int main(int argc, char **argv) {
                 } catch(exception& e) {
                     cerr << "Not creating a VB handler for " << filename << " \"" << e.what() << "\"" << endl;
                     parameters.disable_vbucket(vbid);
+                    vb_handles[vbid].reset();
                 }
             }
 
