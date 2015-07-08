@@ -36,6 +36,12 @@
 #include <atomic>
 #include <climits>
 #include <cstdlib>
+#include <deque>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <chrono>
+#include <set>
 
 using namespace std;
 
@@ -69,6 +75,7 @@ public:
     static const uint64_t start_key_default = 0;
     static const bool low_compression_default = false;
     static const DocType doc_type_default = BINARY_DOC_COMPRESSED;
+    static const int flusher_count_default = 8;
 
     //
     // Construct a program parameters, all parameters assigned default settings
@@ -85,7 +92,8 @@ public:
         vbuckets(vbc_default),
         vbuckets_managed(0),
         start_key(start_key_default),
-        low_compression(low_compression_default) {
+        low_compression(low_compression_default),
+        flusher_count(flusher_count_default) {
         fill(vbuckets.begin(), vbuckets.end(), VB_UNMANAGED);
     }
 
@@ -297,12 +305,18 @@ public:
     }
 
     void disable_vbucket(int vb) {
+        static mutex lock;
+        unique_lock<std::mutex> lck(lock);
         vbuckets[vb] =  VB_UNMANAGED;
         vbuckets_managed--;
     }
 
     bool is_low_compression() {
         return low_compression;
+    }
+
+    int get_flusher_count() {
+        return flusher_count;
     }
 
     static void usage(int exit_code) {
@@ -362,6 +376,7 @@ private:
     int vbuckets_managed;
     uint64_t start_key;
     bool low_compression;
+    int flusher_count;
 };
 
 //
@@ -405,7 +420,8 @@ public:
       key(NULL),
       data_len(dlen),
       data(NULL),
-      parameters(params) {
+      parameters(params),
+      doc_created(0) {
         key = new char[klen];
         data = new char[dlen];
         set_doc(k, klen, dlen);
@@ -458,18 +474,22 @@ public:
         }
 
         memcpy(key, k, klen);
-        if (parameters.is_low_compression()) {
-            srand(0);
-            for (int data_index = 0; data_index < dlen; data_index++) {
-                char data_value = (rand() % 255) % ('Z' - '0');
-                data[data_index] = data_value + '0';
+        // generate doc body only if size has changed.
+        if (doc_created != dlen) {
+            if (parameters.is_low_compression()) {
+                srand(0);
+                for (int data_index = 0; data_index < dlen; data_index++) {
+                    char data_value = (rand() % 255) % ('Z' - '0');
+                    data[data_index] = data_value + '0';
+                }
+            } else {
+                char data_value = 0;
+                for (int data_index = 0; data_index < dlen; data_index++) {
+                    data[data_index] = data_value + '0';
+                    data_value = (data_value + 1) % ('Z' - '0');
+                }
             }
-        } else {
-            char data_value = 0;
-            for (int data_index = 0; data_index < dlen; data_index++) {
-                data[data_index] = data_value + '0';
-                data_value = (data_value + 1) % ('Z' - '0');
-            }
+            doc_created = dlen;
         }
     }
 
@@ -490,6 +510,7 @@ private:
     int data_len;
     char* data;
     ProgramParameters& parameters;
+    int doc_created;
     static uint64_t db_seq;
 };
 
@@ -520,7 +541,7 @@ public:
     //
     VBucket(char* filename,
             int vb,
-            atomic_uint_fast64_t& saved_counter,
+            uint64_t& saved_counter,
             ProgramParameters& params_ref)
         :
         handle(NULL),
@@ -634,6 +655,7 @@ public:
     // Flushes the queue if has reached the flush_threshold.
     //
     void add_doc(char* k, int klen, int dlen) {
+
         if (docs[next_free_doc] == nullptr) {
             docs[next_free_doc] = unique_ptr<Document>(new Document(k, klen, params, dlen));
         }
@@ -675,6 +697,7 @@ public:
             next_free_doc = 0;
             pending_documents = 0;
         }
+
     }
 
     uint64_t get_doc_count() {
@@ -693,7 +716,7 @@ private:
     int flush_threshold;
     vector< unique_ptr<Document> > docs;
     int pending_documents;
-    atomic_uint_fast64_t& documents_saved;
+    uint64_t& documents_saved;
     ProgramParameters& params;
     int vbid;
     uint64_t doc_count;
@@ -702,6 +725,114 @@ private:
     uint64_t vb_seq;
     bool ok_to_set_vbstate;
 };
+
+class VBucketFlusher {
+
+public:
+    VBucketFlusher(ProgramParameters& params) :
+        started(false),
+        documents_saved(0),
+        parameters(params),
+        task_thread(&VBucketFlusher::run, this) {
+    }
+
+    ~VBucketFlusher() {
+    }
+
+    void add_vbucket(uint16_t vbid) {
+        my_vbuckets.insert(vbid);
+    }
+
+    void start() {
+        while(!started) {
+             this_thread::sleep_for(chrono::milliseconds(100));
+        }
+        cvar.notify_one();
+    }
+
+    void join() {
+        task_thread.join();
+    }
+
+    uint64_t get_documents_saved() {
+        return documents_saved;
+    }
+
+private:
+
+    void run() {
+        unique_lock<std::mutex> lck(lock);
+        started = true;
+        cvar.wait(lck);
+
+        vector< unique_ptr<VBucket> > vb_handles(parameters.get_vbc());
+        uint64_t key_value = 0;
+
+        bool start_counting_vbuckets = false;
+
+        char key[64];
+        uint64_t key_max = parameters.is_keys_per_vbucket() ? ULLONG_MAX : parameters.get_key_count();
+
+        // Loop through the key space and create keys, test each key to see if we are managing the vbucket it maps to.
+        for (uint64_t ii = parameters.get_start_key(); ii < (key_max + parameters.get_start_key()); ii++) {
+            int key_len = snprintf(key, 64, "K%020" PRId64, key_value);
+            int vbid = client_hash_crc32(reinterpret_cast<uint8_t*>(key), key_len) % (parameters.get_vbc());
+
+            // Only if the vbucket is managed generate the doc
+            if (my_vbuckets.count(vbid) > 0 && parameters.is_vbucket_managed(vbid)) {
+
+                if (vb_handles[vbid] == nullptr) {
+                    char  filename[32];
+                    snprintf(filename, 32, "%d.couch.1", vbid);
+                    start_counting_vbuckets = true;
+                    try {
+                        vb_handles[vbid] = unique_ptr<VBucket>(new VBucket(filename,
+                                                                           vbid,
+                                                                           documents_saved,
+                                                                           parameters));
+                    } catch(exception& e) {
+                        unique_lock<std::mutex> print_lck(print_lock);
+                        cerr << "Not creating a VB handler for " << filename << " \"" << e.what() << "\"" << endl;
+                        parameters.disable_vbucket(vbid);
+                        vb_handles[vbid].reset();
+                    }
+                }
+
+                // if there's now a handle, go for it
+                if (vb_handles[vbid] != nullptr) {
+                    vb_handles[vbid]->add_doc(key, key_len, parameters.get_doc_len());
+
+                    // If we're generating keys per vbucket, stop managing this vbucket when we've it the limit
+                    if (parameters.is_keys_per_vbucket() && (vb_handles[vbid]->get_doc_count() == parameters.get_key_count())) {
+                        vb_handles[vbid].reset(); // done with this VB
+                        parameters.disable_vbucket(vbid);
+                    }
+                }
+
+            }
+            key_value++;
+
+            // Stop when there's no more vbuckets managed, yet we're past starting
+            if (start_counting_vbuckets && parameters.get_vbuckets_managed() == 0) {
+                break;
+            }
+        }
+
+        vb_handles.clear();
+    }
+
+    atomic<bool> started;
+    uint64_t documents_saved;
+    ProgramParameters& parameters;
+    set<uint16_t> my_vbuckets;
+    deque<VBucket*> work_queue;
+    mutex lock;
+    static mutex print_lock;
+    condition_variable cvar;
+    thread task_thread;
+};
+
+mutex VBucketFlusher::print_lock;
 
 int main(int argc, char **argv) {
 
@@ -712,7 +843,6 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    uint64_t key_value = 0;
     char key[64];
     uint64_t key_max = parameters.is_keys_per_vbucket() ? ULLONG_MAX : parameters.get_key_count();
     cout << "Generating " << parameters.get_key_count() << " keys ";
@@ -740,57 +870,36 @@ int main(int argc, char **argv) {
         cout << "Creating new couch-files" << endl;
     }
 
-    vector< unique_ptr<VBucket> > vb_handles(parameters.get_vbc());
 
-    atomic_uint_fast64_t documents_saved(0);
-    bool start_counting_vbuckets = false;
+    vector< unique_ptr<VBucketFlusher>> vb_flushers(parameters.get_flusher_count());
+    uint64_t documents_saved = 0;
 
-    // Loop through the key space and create keys, test each key to see if we are managing the vbucket it maps to.
-    for (uint64_t ii = parameters.get_start_key(); ii < (key_max + parameters.get_start_key()); ii++) {
-        int key_len = snprintf(key, 64, "K%020" PRId64, key_value);
-        int vbid = client_hash_crc32(reinterpret_cast<uint8_t*>(key), key_len) % (parameters.get_vbc());
-
-        // Only if the vbucket is managed generate the doc
+    // loop through VBs and distribute to flushers.
+    for (int vbid = 0; vbid < parameters.get_vbc(); vbid++) {
         if (parameters.is_vbucket_managed(vbid)) {
-
-            if (vb_handles[vbid] == nullptr) {
-                char  filename[32];
-                snprintf(filename, 32, "%d.couch.1", vbid);
-                start_counting_vbuckets = true;
-                try {
-                    vb_handles[vbid] = unique_ptr<VBucket>(new VBucket(filename,
-                                                                       vbid,
-                                                                       documents_saved,
-                                                                       parameters));
-                } catch(exception& e) {
-                    cerr << "Not creating a VB handler for " << filename << " \"" << e.what() << "\"" << endl;
-                    parameters.disable_vbucket(vbid);
-                    vb_handles[vbid].reset();
-                }
+            if (vb_flushers[vbid % parameters.get_flusher_count()] == nullptr) {
+                vb_flushers[vbid % parameters.get_flusher_count()] = unique_ptr<VBucketFlusher>(new VBucketFlusher(parameters));
             }
-
-            // if there's now a handle, go for it
-            if (vb_handles[vbid] != nullptr) {
-                vb_handles[vbid]->add_doc(key, key_len, parameters.get_doc_len());
-
-                // If we're generating keys per vbucket, stop managing this vbucket when we've it the limit
-                if (parameters.is_keys_per_vbucket() && (vb_handles[vbid]->get_doc_count() == parameters.get_key_count())) {
-                    vb_handles[vbid].reset(); // done with this VB
-                    parameters.disable_vbucket(vbid);
-                }
-            }
-
-        }
-        key_value++;
-
-        // Stop when there's no more vbuckets managed, yet we're past starting
-        if (start_counting_vbuckets && parameters.get_vbuckets_managed() == 0) {
-            break;
+            vb_flushers[vbid % parameters.get_flusher_count()]->add_vbucket(vbid);
         }
     }
 
-    vb_handles.clear();
+    for (auto& flusher : vb_flushers) {
+        if (flusher.get()) {
+            flusher->start();
+        }
+    }
+
+
+    for (auto& flusher : vb_flushers) {
+        if (flusher.get()) {
+            flusher->join();
+            documents_saved += flusher->get_documents_saved();
+        }
+    }
+
     cout << "Saved " << documents_saved << " documents " << endl;
 
+    vb_flushers.clear();
     return 0;
 }
