@@ -39,7 +39,7 @@ void test_sorted_lists()
     void *iterator;
 
     fprintf(stderr, "Running view sorted_list tests\n");
-    sorted_elements = (int *) malloc(sizeof(elements));
+    sorted_elements = (int *) cb_malloc(sizeof(elements));
     cb_assert(sorted_elements != NULL);
     memcpy(sorted_elements, elements, sizeof(elements));
     qsort(sorted_elements, num_elements, sizeof(sorted_elements[0]), int_cmp_fun);
@@ -150,5 +150,5 @@ void test_sorted_lists()
     sorted_list_free_iterator(iterator);
 
     sorted_list_free(list);
-    free(sorted_elements);
+    cb_free(sorted_elements);
 }

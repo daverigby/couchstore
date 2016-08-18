@@ -137,11 +137,11 @@ void test_values()
 
     free_view_btree_value(v);
     free_view_btree_value(v2);
-    free(v_bin2);
-    free(v_bin3);
+    cb_free(v_bin2);
+    cb_free(v_bin3);
 
     free_view_id_btree_value(id_btree_v);
     free_view_id_btree_value(id_btree_v2);
-    free(id_btree_v_bin2);
-    free(id_btree_v_bin3);
+    cb_free(id_btree_v_bin2);
+    cb_free(id_btree_v_bin3);
 }
