@@ -69,6 +69,50 @@ struct CouchbaseRevMetaV2 {
     uint8_t confResMode;
 };
 
+// Additional Couchbase V3 metadata - SyncReplication state
+struct CouchbaseRevMetaV3 {
+    raw_16 timeoutMs;
+    union {
+        uint8_t packed;
+        struct {
+            uint8_t operation : 3;
+            uint8_t level : 3;
+            uint8_t _unused : 2;
+        } fields;
+    } opAndLevel;
+
+    uint8_t getOperation() const {
+        return opAndLevel.fields.operation;
+    }
+
+    const char* getOperationName() const {
+        switch (opAndLevel.fields.operation) {
+        case 0:
+            return "pending";
+        case 1:
+            return "commit";
+        case 2:
+            return "abort";
+        default:
+            return "<INVALID>";
+        }
+    }
+    const char* getLevelName() const {
+        switch (opAndLevel.fields.level) {
+        case 0:
+            return "none";
+        case 1:
+            return "majority";
+        case 2:
+            return "majorityAndPersistOnMaster";
+        case 3:
+            return "persistToMajority";
+        default:
+            return "<INVALID>";
+        }
+    }
+};
+
 extern const std::string vbucket_serialised_manifest_entry_raw_schema;
 extern const std::string collections_kvstore_schema;
 
@@ -374,6 +418,42 @@ static int foldprint(Db *db, DocInfo *docinfo, void *ctx)
             printf(",\"conflict_resolution_mode\":%d", conf_res_mode);
         } else {
             printf(", conflict_resolution_mode: %d", conf_res_mode);
+        }
+    }
+
+    if (docinfo->rev_meta.size >= sizeof(CouchbaseRevMeta) +
+                                          sizeof(CouchbaseRevMetaV1) +
+                                          sizeof(CouchbaseRevMetaV3)) {
+        // 21 bytes of rev_meta indicates CouchbaseRevMetaV3 - adds
+        // Synchronous Replication state.
+        if (docinfo->rev_meta.size < sizeof(CouchbaseRevMeta) +
+                                             sizeof(CouchbaseRevMetaV1) +
+                                             sizeof(CouchbaseRevMetaV3)) {
+            printf("     Error parsing the document: Possible corruption\n");
+            return 1;
+        }
+
+        const auto* metaV3 =
+                (const CouchbaseRevMetaV3*)(docinfo->rev_meta.buf +
+                                            sizeof(CouchbaseRevMeta) +
+                                            sizeof(CouchbaseRevMetaV1));
+
+        const auto timeoutMs = decode_raw16(metaV3->timeoutMs);
+
+        if (dumpJson) {
+            printf(",\"sync_write\":\"%s\"", metaV3->getOperationName());
+            if (metaV3->getOperation() == 0 /*Pending*/) {
+                printf(",\"level\":\"%s\",\"timeoutMs\":%d",
+                       metaV3->getLevelName(),
+                       timeoutMs);
+            }
+        } else {
+            printf(", sync_write: %s", metaV3->getOperationName());
+            if (metaV3->getOperation() == 0 /*Pending*/) {
+                printf(" [level: %s, timeoutMs: %d]",
+                       metaV3->getLevelName(),
+                       timeoutMs);
+            }
         }
     }
 
