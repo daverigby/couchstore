@@ -19,6 +19,7 @@
 
 #include <assert.h>
 #include <fcntl.h>
+#include <phosphor/phosphor.h>
 #include <platform/cb_malloc.h>
 #include <platform/cbassert.h>
 #include <platform/platform_socket.h>
@@ -27,10 +28,10 @@
 #include <cstddef>
 #include <string>
 
+#include "bitfield.h"
+#include "couch_btree.h"
 #include "internal.h"
 #include "node_types.h"
-#include "couch_btree.h"
-#include "bitfield.h"
 #include "reduces.h"
 #include "util.h"
 
@@ -267,6 +268,8 @@ couchstore_error_t precommit(Db *db)
 LIBCOUCHSTORE_API
 couchstore_error_t couchstore_commit(Db *db)
 {
+    TRACE_EVENT0("couchstore", "commit");
+
     COLLECT_LATENCY();
 
     couchstore_error_t errcode = precommit(db);
@@ -1332,6 +1335,13 @@ cleanup:
 LIBCOUCHSTORE_API
 couchstore_error_t couchstore_save_local_document(Db *db, LocalDoc *lDoc)
 {
+    TRACE_EVENT2("couchstore",
+                 "save_local_document",
+                 "key",
+                 PHOSPHOR_INLINE_STR_N(lDoc->id.buf, lDoc->id.size),
+                 "size",
+                 lDoc->json.size);
+
     couchstore_error_t errcode;
     couchfile_modify_action ldupdate;
     couchfile_modify_request rq;

@@ -101,6 +101,8 @@ ssize_t PosixFileOps::pread(couchstore_error_info_t* errinfo,
                             size_t nbyte,
                             cs_off_t offset)
 {
+    TRACE_EVENT2("couchstore", "PosixFileOps::pread", "nbyte", nbyte, "offset", offset);
+
 #ifdef LOG_IO
     fprintf(stderr, "PREAD  %8llx -- %8llx  (%6.1f kbytes)\n", offset,
             offset+nbyte, nbyte/1024.0);
@@ -124,6 +126,13 @@ ssize_t PosixFileOps::pwrite(couchstore_error_info_t* errinfo,
                              size_t nbyte,
                              cs_off_t offset)
 {
+    TRACE_EVENT2("couchstore",
+                 "PosixFileOps::pwrite",
+                 "nbyte",
+                 nbyte,
+                 "offset",
+                 offset);
+
 #ifdef LOG_IO
     fprintf(stderr, "PWRITE %8llx -- %8llx  (%6.1f kbytes)\n", offset,
             offset+nbyte, nbyte/1024.0);
@@ -207,6 +216,8 @@ couchstore_error_t PosixFileOps::open(couchstore_error_info_t* errinfo,
                                       const char* path,
                                       int oflag)
 {
+    TRACE_EVENT0("couchstore", "PosixFileOps::open");
+
     auto* file = to_file(*handle);
     if (file) {
         cb_assert(file->fd == -1);
@@ -236,6 +247,8 @@ couchstore_error_t PosixFileOps::open(couchstore_error_info_t* errinfo,
 couchstore_error_t PosixFileOps::close(couchstore_error_info_t* errinfo,
                                        couch_file_handle handle)
 {
+    TRACE_EVENT0("couchstore", "PosixFileOps::close");
+
     auto* file = to_file(handle);
     int rv = 0;
     couchstore_error_t error = COUCHSTORE_SUCCESS;
@@ -296,6 +309,8 @@ cs_off_t PosixFileOps::goto_eof(couchstore_error_info_t* errinfo,
 couchstore_error_t PosixFileOps::sync(couchstore_error_info_t* errinfo,
                                       couch_file_handle handle)
 {
+    TRACE_EVENT0("couchstore", "PosixFileOps::sync");
+
     auto* file = to_file(handle);
     int rv;
     do {

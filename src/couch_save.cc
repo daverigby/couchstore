@@ -1,16 +1,17 @@
 /* -*- Mode: C; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 #include "couchstore_config.h"
 
+#include <phosphor/phosphor.h>
 #include <platform/cb_malloc.h>
-#include <string.h>
 #include <stddef.h>
 #include <stdlib.h>
+#include <string.h>
 
+#include "couch_btree.h"
 #include "internal.h"
 #include "node_types.h"
-#include "util.h"
 #include "reduces.h"
-#include "couch_btree.h"
+#include "util.h"
 
 #include "couch_latency_internal.h"
 
@@ -348,6 +349,10 @@ couchstore_error_t couchstore_save_documents_and_callback(
         save_callback_fn save_cb,
         void* save_cb_ctx) {
     COLLECT_LATENCY();
+
+    TRACE_EVENT1("couchstore",
+                 "save_documents_and_callback",
+                 "#docs", numdocs);
 
     couchstore_error_t errcode = COUCHSTORE_SUCCESS;
     unsigned ii;
